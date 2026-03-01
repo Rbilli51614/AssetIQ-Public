@@ -28,12 +28,7 @@
 
 pipeline {
 
-    agent {
-        docker {
-            image 'python:3.11-slim'
-            args  '--group-add docker -v /var/run/docker.sock:/var/run/docker.sock'
-        }
-    }
+    agent none
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '30'))
@@ -49,6 +44,7 @@ pipeline {
         TF_IN_AUTOMATION   = '1'
         TF_INPUT           = '0'
         NODE_VERSION       = '20'
+        STACK_DIR          = 'assetiq-client'
         // IMAGE_TAG and DASHBOARD_BUCKET set in Checkout stage
     }
 
@@ -79,11 +75,13 @@ pipeline {
 
         // ── 1. Checkout ───────────────────────────────────────────────────────
         stage('Checkout') {
+            agent { label 'python || builder || infra' }
             steps {
                 checkout scm
                 script {
                     env.IMAGE_TAG   = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    env.BRANCH_NAME = env.BRANCH_NAME ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    def rawBranch   = env.GIT_BRANCH ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    env.BRANCH_NAME = rawBranch.replaceAll(/^origin\//, '')
                     env.DEPLOY_ENV  = params.ENVIRONMENT
 
                     echo "Branch:      ${env.BRANCH_NAME}"
@@ -96,21 +94,27 @@ pipeline {
 
         // ── 2. Install Python Dependencies ────────────────────────────────────
         stage('Install Python Dependencies') {
+            agent { label 'python' }
             steps {
                 sh '''
-                    pip install --quiet --upgrade pip
-                    pip install --quiet fastapi uvicorn pydantic redis sqlalchemy asyncpg httpx requests
-                    pip install --quiet pytest pytest-asyncio flake8
-                    pip install --quiet -e sdk/python
+                    # python3 must be pre-installed: docker exec -u root jenkins apt-get install -y python3 python3-pip
+                    python3 --version
+                    REQ=$(find . -name requirements.txt | grep -v node_modules | head -1)
+                    [ -n "$REQ" ] && python3 -m pip install --quiet -r "$REQ" --break-system-packages || true
+                    python3 -m pip install --quiet fastapi uvicorn pydantic redis sqlalchemy asyncpg httpx requests --break-system-packages
+                    python3 -m pip install --quiet pytest pytest-asyncio flake8 --break-system-packages
+                    python3 -m pip install --quiet -e ${STACK_DIR}/sdk/python --break-system-packages
                 '''
             }
         }
 
         // ── 3. Python Lint ────────────────────────────────────────────────────
         stage('Python Lint') {
+            agent { label 'python' }
             when { not { expression { params.SKIP_TESTS } } }
             steps {
                 sh '''
+                    cd ${STACK_DIR}
                     flake8 api/ sdk/python/ client_config.py \
                         --max-line-length=120 \
                         --exclude=__pycache__,*.egg-info \
@@ -121,9 +125,11 @@ pipeline {
 
         // ── 4. Python Tests ───────────────────────────────────────────────────
         stage('Python Tests') {
+            agent { label 'python' }
             when { not { expression { params.SKIP_TESTS } } }
             steps {
                 sh '''
+                    cd ${STACK_DIR}
                     pytest tests/ \
                         -v \
                         --tb=short \
@@ -149,9 +155,11 @@ pipeline {
         // ── 5. SDK Validation ─────────────────────────────────────────────────
         // Verify both SDK flavours are importable and pass basic sanity checks.
         stage('SDK Validation') {
+            agent { label 'python' }
             when { not { expression { params.SKIP_TESTS } } }
             steps {
                 sh '''
+                    cd ${STACK_DIR}
                     # Python SDK — import check
                     python3 -c "
 from assetiq import (
@@ -178,6 +186,7 @@ print('TypeScript SDK: static check OK')
 
         // ── 6. Dashboard Build ────────────────────────────────────────────────
         stage('Dashboard Build') {
+            agent { label 'builder' }
             when {
                 anyOf {
                     branch 'main'
@@ -186,16 +195,18 @@ print('TypeScript SDK: static check OK')
             }
             steps {
                 sh '''
-                    # Install Node.js
-                    curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -
-                    apt-get install -y nodejs --quiet
+                    # Install Node.js if not present
+                    which node || {
+                        curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - 2>/dev/null || true
+                        apt-get install -y nodejs --quiet 2>/dev/null || true
+                    }
                     node --version && npm --version
                 '''
                 withCredentials([
                     string(credentialsId: 'assetiq-api-key', variable: 'ASSETIQ_API_KEY')
                 ]) {
                     sh '''
-                        cd dashboard
+                        cd ${STACK_DIR}/dashboard
                         npm ci --prefer-offline --loglevel=warn
 
                         # Lint TypeScript/React
@@ -214,13 +225,14 @@ print('TypeScript SDK: static check OK')
             }
             post {
                 success {
-                    archiveArtifacts artifacts: 'dashboard/dist/**', fingerprint: true
+                    archiveArtifacts artifacts: '${STACK_DIR}/dashboard/dist/**', fingerprint: true
                 }
             }
         }
 
         // ── 7. Docker Build (Client API Proxy) ────────────────────────────────
         stage('Docker Build') {
+            agent { label 'builder' }
             when {
                 anyOf {
                     branch 'main'
@@ -229,6 +241,7 @@ print('TypeScript SDK: static check OK')
             }
             steps {
                 sh '''
+                    cd ${STACK_DIR}
                     docker build \
                         -t assetiq-client-api:${IMAGE_TAG} \
                         -f api/Dockerfile \
@@ -241,6 +254,7 @@ print('TypeScript SDK: static check OK')
 
         // ── 8. ECR Push ───────────────────────────────────────────────────────
         stage('ECR Push') {
+            agent { label 'builder' }
             when { branch 'main' }
             steps {
                 withCredentials([
@@ -252,7 +266,7 @@ print('TypeScript SDK: static check OK')
                     ]
                 ]) {
                     sh '''
-                        which aws || pip install --quiet awscli
+                        which aws || python3 -m pip install --quiet awscli --break-system-packages
 
                         ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
                         ECR_BASE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -277,6 +291,7 @@ print('TypeScript SDK: static check OK')
 
         // ── 9. Terraform Init ─────────────────────────────────────────────────
         stage('Terraform Init') {
+            agent { label 'infra' }
             when {
                 anyOf {
                     branch 'main'
@@ -306,7 +321,7 @@ print('TypeScript SDK: static check OK')
                         terraform version
                     '''
                     sh '''
-                        cd terraform
+                        cd ${STACK_DIR}/terraform
                         terraform init \
                             -backend-config="bucket=${TF_BACKEND_BUCKET}" \
                             -backend-config="key=assetiq-client/${DEPLOY_ENV}/terraform.tfstate" \
@@ -320,6 +335,7 @@ print('TypeScript SDK: static check OK')
 
         // ── 10. Terraform Plan ────────────────────────────────────────────────
         stage('Terraform Plan') {
+            agent { label 'infra' }
             when {
                 anyOf {
                     branch 'main'
@@ -341,7 +357,7 @@ print('TypeScript SDK: static check OK')
                     string(credentialsId: 'assetiq-api-key',     variable: 'TF_VAR_assetiq_api_key')
                 ]) {
                     sh '''
-                        cd terraform
+                        cd ${STACK_DIR}/terraform
                         terraform plan \
                             -var="environment=${DEPLOY_ENV}" \
                             -var="aws_region=${AWS_REGION}" \
@@ -349,13 +365,14 @@ print('TypeScript SDK: static check OK')
                             -out=tfplan.binary
                         terraform show -no-color tfplan.binary > tfplan.txt
                     '''
-                    archiveArtifacts artifacts: 'terraform/tfplan.txt', fingerprint: true
+                    archiveArtifacts artifacts: '${STACK_DIR}/terraform/tfplan.txt', fingerprint: true
                 }
             }
         }
 
         // ── 11. Terraform Apply ───────────────────────────────────────────────
         stage('Terraform Apply') {
+            agent { label 'infra' }
             when { branch 'main' }
             steps {
                 withCredentials([
@@ -372,24 +389,25 @@ print('TypeScript SDK: static check OK')
                     string(credentialsId: 'assetiq-api-key',     variable: 'TF_VAR_assetiq_api_key')
                 ]) {
                     sh '''
-                        cd terraform
+                        cd ${STACK_DIR}/terraform
                         terraform apply -auto-approve tfplan.binary
                         terraform output -json > tf_outputs.json
                     '''
                     // Expose the dashboard bucket name for the S3 deploy stage
                     script {
-                        def outputs = readJSON file: 'terraform/tf_outputs.json'
+                        def outputs = readJSON file: "${STACK_DIR}/terraform/tf_outputs.json"
                         env.DASHBOARD_BUCKET     = outputs.dashboard_bucket?.value       ?: ''
                         env.CLOUDFRONT_DIST_ID   = outputs.cloudfront_distribution_id?.value ?: ''
                         env.CLIENT_API_ENDPOINT  = outputs.api_endpoint?.value           ?: ''
                     }
-                    archiveArtifacts artifacts: 'terraform/tf_outputs.json', fingerprint: true
+                    archiveArtifacts artifacts: '${STACK_DIR}/terraform/tf_outputs.json', fingerprint: true
                 }
             }
         }
 
         // ── 12. Deploy API (ECS) ──────────────────────────────────────────────
         stage('Deploy API') {
+            agent { label 'infra' }
             when { branch 'main' }
             steps {
                 withCredentials([
@@ -401,7 +419,7 @@ print('TypeScript SDK: static check OK')
                     ]
                 ]) {
                     sh '''
-                        which aws || pip install --quiet awscli
+                        which aws || python3 -m pip install --quiet awscli --break-system-packages
 
                         CLUSTER="${APP_NAME}-${DEPLOY_ENV}-cluster"
                         SERVICE="${APP_NAME}-${DEPLOY_ENV}-api"
@@ -430,6 +448,7 @@ print('TypeScript SDK: static check OK')
 
         // ── 13. Deploy Dashboard (S3 + CloudFront) ────────────────────────────
         stage('Deploy Dashboard') {
+            agent { label 'infra' }
             when { branch 'main' }
             steps {
                 withCredentials([
@@ -451,14 +470,14 @@ print('TypeScript SDK: static check OK')
                         echo "Syncing dashboard build to s3://${DASHBOARD_BUCKET}"
 
                         # Sync immutable hashed assets with long cache TTL
-                        aws s3 sync dashboard/dist/assets/ \
+                        aws s3 sync ${STACK_DIR}/dashboard/dist/assets/ \
                             s3://${DASHBOARD_BUCKET}/assets/ \
                             --cache-control "public, max-age=31536000, immutable" \
                             --delete \
                             --region ${AWS_REGION}
 
                         # Sync HTML and root files with no-cache (always revalidate)
-                        aws s3 sync dashboard/dist/ \
+                        aws s3 sync ${STACK_DIR}/dashboard/dist/ \
                             s3://${DASHBOARD_BUCKET}/ \
                             --exclude "assets/*" \
                             --cache-control "no-cache, no-store, must-revalidate" \
@@ -489,6 +508,7 @@ print('TypeScript SDK: static check OK')
 
         // ── 14. Smoke Test ────────────────────────────────────────────────────
         stage('Smoke Test') {
+            agent { label 'infra' }
             when { branch 'main' }
             steps {
                 sh '''
@@ -553,8 +573,20 @@ Build:     ${BUILD_URL}
         }
 
         always {
-            sh 'docker rmi assetiq-client-api:${IMAGE_TAG} 2>/dev/null || true'
-            cleanWs()
+            script {
+                try {
+                    if (env.IMAGE_TAG) {
+                        sh 'docker rmi assetiq-client-api:${IMAGE_TAG} 2>/dev/null || true'
+                    }
+                } catch (ignored) {
+                    echo "Docker cleanup skipped — no workspace context."
+                }
+                try {
+                    cleanWs()
+                } catch (ignored) {
+                    echo "Workspace cleanup skipped — no workspace context."
+                }
+            }
         }
 
     }

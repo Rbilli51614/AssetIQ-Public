@@ -32,8 +32,8 @@ This is intentional:
 
 ```bash
 # 1. Configure your API key (provided by AssetIQ during onboarding)
-export ASSETIQ_API_KEY=aiq_your_key_here
-export ASSETIQ_API_URL=https://api.assetiq.io
+export ASSETIQ_API_KEY=1234
+export ASSETIQ_API_URL=https://ironpeaktest.com
 
 # 2. Install the Python SDK
 pip install -e sdk/python
@@ -47,9 +47,9 @@ cd dashboard && npm install && npm start
 
 ## API Reference
 
-Full API documentation: https://docs.assetiq.io
+Full API documentation: https://ironpeaktest.com
 
-Base URL: `https://api.assetiq.io`
+Base URL: `https://ironpeaktest.com`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -64,7 +64,7 @@ Base URL: `https://api.assetiq.io`
 All requests require an `X-API-Key` header:
 
 ```
-X-API-Key: aiq_your_key_here
+X-API-Key: 1234
 ```
 
 Keys are scoped to your tenant. Contact support to rotate keys.
@@ -73,4 +73,4 @@ Keys are scoped to your tenant. Contact support to rotate keys.
 
 - Documentation: https://docs.assetiq.io
 - Support: support@assetiq.io
-- Status: https://status.assetiq.io
+- Status: https://ironpeaktest.com
